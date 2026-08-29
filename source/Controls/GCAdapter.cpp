@@ -148,36 +148,18 @@ static bool TryOpenAdapter(void)
 	if (!found)
 		return false;
 
-	// find the hid host handle: it answers v5 GetVersion AND knows our
-	// device id (the ven handle answers the version too, but rejects
-	// device ioctls for hid device ids)
+	// use libogc's own hid handle, exported by our vendored usb.c
+	extern "C" s32 USB_GetHidHostFd(void);
+	HidFd = USB_GetHidHostFd();
 	if (HidFd < 0)
 	{
-		for (s32 fd = 0; fd < 32; fd++)
-		{
-			u32 *ver = (u32 *) IoBuf;
-			memset(IoBuf, 0, 0x20);
-			if (IOS_Ioctl(fd, HIDV5_IOCTL_GETVERSION, NULL, 0, IoBuf, 0x20) != 0 || ver[0] != 0x50001)
-				continue;
-			HidFd = fd;
-			memset(InfoBuf, 0, sizeof(InfoBuf));
-			s32 info = DeviceIoctl(HIDV5_IOCTL_GETDEVICEINFO, NULL, 0, InfoBuf, 0x60);
-			DebugLog("fd %d: v5 host, info=%d\n", (int) fd, (int) info);
-			if (info >= 0)
-				break; // this handle owns our device
-			// try attaching on this handle, maybe info needs it
-			s32 att = DeviceIoctl(HIDV5_IOCTL_ATTACH, NULL, 0, NULL, 0);
-			DebugLog("fd %d: attach=%d\n", (int) fd, (int) att);
-			if (att >= 0)
-				break;
-			HidFd = -1;
-		}
-	}
-	if (HidFd < 0)
-	{
-		DebugLog("no usable v5 hid handle found\n");
+		DebugLog("no hid host (fd=%d)\n", (int) HidFd);
 		return false;
 	}
+	u32 *ver = (u32 *) IoBuf;
+	memset(IoBuf, 0, 0x20);
+	s32 verRes = IOS_Ioctl(HidFd, HIDV5_IOCTL_GETVERSION, NULL, 0, IoBuf, 0x20);
+	DebugLog("hidfd=%d getversion=%d ver=%08x\n", (int) HidFd, (int) verRes, (unsigned int) ver[0]);
 
 	s32 attach = DeviceIoctl(HIDV5_IOCTL_ATTACH, NULL, 0, NULL, 0);
 	u32 resumed = 1;
