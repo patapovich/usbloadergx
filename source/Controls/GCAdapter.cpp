@@ -12,7 +12,7 @@
  ***************************************************************************/
 #include <gccore.h>
 #include <ogc/lwp.h>
-#include <ogc/usb.h>
+#include <ogc/ipc.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -24,14 +24,24 @@
 
 #define GCA_VID 0x057E
 #define GCA_PID 0x0337
-#define GCA_EP_IN 0x81
-#define GCA_EP_OUT 0x02
 #define GCA_REPORT_SIZE 37
 #define GCA_STICK_DEADZONE 15
 
+// raw /dev/usb/hid v5 ioctls, see wiibrew /dev/usb/hid_(v5)
+#define HIDV5_IOCTL_GETVERSION 0
+#define HIDV5_IOCTL_GETDEVICECHANGE 1
+#define HIDV5_IOCTL_GETDEVICEINFO 3
+#define HIDV5_IOCTL_ATTACH 4
+#define HIDV5_IOCTL_RELEASE 5
+#define HIDV5_IOCTL_ATTACHFINISH 6
+#define HIDV5_IOCTL_SUSPENDRESUME 0x10
+#define HIDV5_IOCTL_INTRMSG 0x13
+
 static lwp_t AdapterThread = LWP_THREAD_NULL;
 static volatile bool Running = false;
-static volatile s32 AdapterFd = -1;
+static volatile s32 HidFd = -1;
+static u32 DeviceId = 0;
+static u8 EpIn = 0x81, EpOut = 0x02;
 static volatile bool PortConnected = false;
 static volatile u16 HeldButtons = 0;
 static volatile s8 StickX = 0, StickY = 0, CStickX = 0, CStickY = 0;
@@ -39,8 +49,12 @@ static volatile u8 TriggerL = 0, TriggerR = 0;
 static u16 PrevButtons = 0;
 
 static u8 Report[GCA_REPORT_SIZE] ATTRIBUTE_ALIGN(32);
-static u8 PollCmd[1] ATTRIBUTE_ALIGN(32) = {0x13};
-static int DebugLogsLeft = 6;
+static u8 PollCmd[32] ATTRIBUTE_ALIGN(32);
+static u8 IoBuf[0x180] ATTRIBUTE_ALIGN(32);
+static u8 InfoBuf[0x60] ATTRIBUTE_ALIGN(32);
+static u8 MsgBuf[32] ATTRIBUTE_ALIGN(32);
+static ioctlv IntrVec[2] ATTRIBUTE_ALIGN(32);
+static int DebugLogsLeft = 10;
 
 static void DebugLog(const char *fmt, ...)
 {
@@ -82,50 +96,118 @@ static s8 ApplyDeadzone(s16 value)
 	return 0;
 }
 
+static s32 DeviceIoctl(u8 ioctl, const void *extra, u8 extraLen, void *out, u32 outLen)
+{
+	memset(MsgBuf, 0, sizeof(MsgBuf));
+	*(u32 *) MsgBuf = DeviceId;
+	if (extra && extraLen)
+		memcpy(MsgBuf + 8, extra, extraLen);
+	return IOS_Ioctl(HidFd, ioctl, MsgBuf, 0x20, out, outLen);
+}
+
+static s32 IntrTransfer(u32 out_dir, void *data, u16 len)
+{
+	static u8 msg[32] ATTRIBUTE_ALIGN(32);
+	memset(msg, 0, sizeof(msg));
+	*(u32 *) (msg + 0) = DeviceId;
+	*(u32 *) (msg + 8) = out_dir; // non-zero: interrupt OUT, zero: IN
+
+	IntrVec[0].data = msg;
+	IntrVec[0].len = 32;
+	IntrVec[1].data = data;
+	IntrVec[1].len = len;
+
+	if (out_dir)
+		return IOS_Ioctlv(HidFd, HIDV5_IOCTL_INTRMSG, 2, 0, IntrVec);
+	return IOS_Ioctlv(HidFd, HIDV5_IOCTL_INTRMSG, 1, 1, IntrVec);
+}
+
 static bool TryOpenAdapter(void)
 {
-	static usb_device_entry devices[8] ATTRIBUTE_ALIGN(32);
-	u8 count = 0;
-	s32 listRes = USB_GetDeviceList(devices, 8, USB_CLASS_HID, &count);
-	if (listRes < 0 || count == 0)
+	s32 fd = IOS_Open("/dev/usb/hid", 0);
+	if (fd < 0)
 	{
-		// some interface versions don't want a class filter
-		s32 listRes0 = USB_GetDeviceList(devices, 8, 0, &count);
-		DebugLog("list(HID)=%d list(0)=%d count=%u ios=%d\n",
-				 (int) listRes, (int) listRes0, count, IOS_GetVersion());
-		if (listRes0 < 0)
-			return false;
+		DebugLog("hid open=%d\n", (int) fd);
+		return false;
 	}
 
-	for (u8 i = 0; i < count; i++)
+	u32 *ver = (u32 *) IoBuf;
+	memset(IoBuf, 0, 0x20);
+	s32 res = IOS_Ioctl(fd, HIDV5_IOCTL_GETVERSION, NULL, 0, IoBuf, 0x20);
+	if (res < 0 || ver[0] != 0x50001)
 	{
-		DebugLog("dev %u: id=%08x vid=%04x pid=%04x\n",
-				 i, (unsigned int) devices[i].device_id, devices[i].vid, devices[i].pid);
-		if (devices[i].vid != GCA_VID || devices[i].pid != GCA_PID)
-			continue;
-
-		// Do not use USB_OpenDevice: its descriptor read (GETDEVPARAMS)
-		// fails on d2x cIOS. For v5 device ids (>= 0x20) the transfer
-		// functions accept the device id directly as the handle.
-		s32 resumeRes = USB_ResumeDevice(devices[i].device_id);
-
-		// start polling
-		s32 wr = USB_WriteIntrMsg(devices[i].device_id, GCA_EP_OUT, sizeof(PollCmd), PollCmd);
-		DebugLog("resume=%d pollcmd write=%d\n", (int) resumeRes, (int) wr);
-		if (wr < 0)
-			return false;
-		AdapterFd = devices[i].device_id;
-		gprintf("GCAdapter: using device id %08x\n", (unsigned int) AdapterFd);
-		return true;
+		DebugLog("getversion=%d ver=%08x\n", (int) res, (unsigned int) ver[0]);
+		IOS_Close(fd);
+		return false;
 	}
-	return false;
+
+	memset(IoBuf, 0, sizeof(IoBuf));
+	res = IOS_Ioctl(fd, HIDV5_IOCTL_GETDEVICECHANGE, NULL, 0, IoBuf, 0x180);
+	// unlock the manager for other handles no matter what
+	IOS_Ioctl(fd, HIDV5_IOCTL_ATTACHFINISH, NULL, 0, NULL, 0);
+	if (res < 0)
+	{
+		DebugLog("devicechange=%d\n", (int) res);
+		IOS_Close(fd);
+		return false;
+	}
+
+	bool found = false;
+	for (s32 i = 0; i < res && i < 32; i++)
+	{
+		const u8 *e = &IoBuf[i * 12];
+		u16 vid = (e[4] << 8) | e[5];
+		u16 pid = (e[6] << 8) | e[7];
+		if (vid == GCA_VID && pid == GCA_PID)
+		{
+			DeviceId = *(u32 *) e;
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+	{
+		IOS_Close(fd);
+		return false;
+	}
+
+	HidFd = fd;
+
+	s32 attach = DeviceIoctl(HIDV5_IOCTL_ATTACH, NULL, 0, NULL, 0);
+	u32 resumed = 1;
+	s32 resume = DeviceIoctl(HIDV5_IOCTL_SUSPENDRESUME, &resumed, sizeof(resumed), NULL, 0);
+	memset(InfoBuf, 0, sizeof(InfoBuf));
+	s32 info = DeviceIoctl(HIDV5_IOCTL_GETDEVICEINFO, NULL, 0, InfoBuf, 0x60);
+	if (info >= 0)
+	{
+		// interrupt endpoint descriptors at fixed offsets, address at +2
+		if (InfoBuf[80 + 2])
+			EpIn = InfoBuf[80 + 2];
+		if (InfoBuf[88 + 2])
+			EpOut = InfoBuf[88 + 2];
+	}
+
+	memset(PollCmd, 0, sizeof(PollCmd));
+	PollCmd[0] = 0x13;
+	s32 wr = IntrTransfer(1, PollCmd, 1);
+	DebugLog("id=%08x attach=%d resume=%d info=%d ep=%02x/%02x write=%d\n",
+			 (unsigned int) DeviceId, (int) attach, (int) resume, (int) info, EpIn, EpOut, (int) wr);
+	if (wr < 0)
+	{
+		DeviceIoctl(HIDV5_IOCTL_RELEASE, NULL, 0, NULL, 0);
+		IOS_Close(fd);
+		HidFd = -1;
+		return false;
+	}
+	gprintf("GCAdapter: attached, device %08x\n", (unsigned int) DeviceId);
+	return true;
 }
 
 static void *AdapterLoop(void *arg)
 {
 	while (Running)
 	{
-		if (AdapterFd < 0)
+		if (HidFd < 0)
 		{
 			if (!TryOpenAdapter())
 			{
@@ -134,14 +216,17 @@ static void *AdapterLoop(void *arg)
 			}
 		}
 
-		s32 res = USB_ReadIntrMsg(AdapterFd, GCA_EP_IN, GCA_REPORT_SIZE, Report);
+		s32 res = IntrTransfer(0, Report, GCA_REPORT_SIZE);
 		if (res < 0)
 		{
 			gprintf("GCAdapter: read error %d\n", res);
 			DebugLog("read error=%d\n", (int) res);
-			AdapterFd = -1;
+			s32 fd = HidFd;
+			HidFd = -1;
 			PortConnected = false;
 			HeldButtons = 0;
+			if (fd >= 0)
+				IOS_Close(fd);
 			usleep(1000 * 1000);
 			continue;
 		}
@@ -172,10 +257,11 @@ static void *AdapterLoop(void *arg)
 			HeldButtons = 0;
 	}
 
-	if (AdapterFd >= 0)
+	if (HidFd >= 0)
 	{
-		USB_SuspendDevice(AdapterFd);
-		AdapterFd = -1;
+		DeviceIoctl(HIDV5_IOCTL_RELEASE, NULL, 0, NULL, 0);
+		IOS_Close(HidFd);
+		HidFd = -1;
 	}
 	return NULL;
 }
@@ -184,13 +270,7 @@ void GCAdapter_Init(void)
 {
 	if (Running)
 		return;
-	s32 initRes = USB_Initialize();
-	DebugLog("USB_Initialize=%d ios=%d\n", (int) initRes, IOS_GetVersion());
-	if (initRes < 0)
-	{
-		gprintf("GCAdapter: USB_Initialize failed\n");
-		return;
-	}
+	DebugLog("GCAdapter init, ios=%d\n", IOS_GetVersion());
 	Running = true;
 	if (LWP_CreateThread(&AdapterThread, AdapterLoop, NULL, NULL, 16 * 1024, 70) < 0)
 	{
