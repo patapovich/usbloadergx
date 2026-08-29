@@ -13,8 +13,10 @@
 #include <gccore.h>
 #include <ogc/lwp.h>
 #include <ogc/usb.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdarg.h>
 
 #include "Controls/GCAdapter.h"
 #include "GUI/gui.h"
@@ -38,6 +40,22 @@ static u16 PrevButtons = 0;
 
 static u8 Report[GCA_REPORT_SIZE] ATTRIBUTE_ALIGN(32);
 static u8 PollCmd[1] ATTRIBUTE_ALIGN(32) = {0x13};
+static int DebugLogsLeft = 6;
+
+static void DebugLog(const char *fmt, ...)
+{
+	if (DebugLogsLeft <= 0)
+		return;
+	DebugLogsLeft--;
+	FILE *f = fopen("sd:/gcadapter.log", "a");
+	if (!f)
+		return;
+	va_list args;
+	va_start(args, fmt);
+	vfprintf(f, fmt, args);
+	va_end(args);
+	fclose(f);
+}
 
 static u16 MapButtons(u8 b1, u8 b2)
 {
@@ -68,20 +86,33 @@ static bool TryOpenAdapter(void)
 {
 	static usb_device_entry devices[8] ATTRIBUTE_ALIGN(32);
 	u8 count = 0;
-	if (USB_GetDeviceList(devices, 8, USB_CLASS_HID, &count) < 0)
-		return false;
+	s32 listRes = USB_GetDeviceList(devices, 8, USB_CLASS_HID, &count);
+	if (listRes < 0 || count == 0)
+	{
+		// some interface versions don't want a class filter
+		s32 listRes0 = USB_GetDeviceList(devices, 8, 0, &count);
+		DebugLog("list(HID)=%d list(0)=%d count=%u ios=%d\n",
+				 (int) listRes, (int) listRes0, count, IOS_GetVersion());
+		if (listRes0 < 0)
+			return false;
+	}
 
 	for (u8 i = 0; i < count; i++)
 	{
+		DebugLog("dev %u: id=%08x vid=%04x pid=%04x\n",
+				 i, (unsigned int) devices[i].device_id, devices[i].vid, devices[i].pid);
 		if (devices[i].vid != GCA_VID || devices[i].pid != GCA_PID)
 			continue;
 
 		s32 fd;
-		if (USB_OpenDevice(devices[i].device_id, GCA_VID, GCA_PID, &fd) < 0)
+		s32 openRes = USB_OpenDevice(devices[i].device_id, GCA_VID, GCA_PID, &fd);
+		DebugLog("open=%d fd=%d\n", (int) openRes, (int) fd);
+		if (openRes < 0)
 			return false;
 
 		// start polling
-		USB_WriteIntrMsg(fd, GCA_EP_OUT, sizeof(PollCmd), PollCmd);
+		s32 wr = USB_WriteIntrMsg(fd, GCA_EP_OUT, sizeof(PollCmd), PollCmd);
+		DebugLog("pollcmd write=%d\n", (int) wr);
 		AdapterFd = fd;
 		gprintf("GCAdapter: opened, fd %d\n", fd);
 		return true;
@@ -154,7 +185,9 @@ void GCAdapter_Init(void)
 {
 	if (Running)
 		return;
-	if (USB_Initialize() < 0)
+	s32 initRes = USB_Initialize();
+	DebugLog("USB_Initialize=%d ios=%d\n", (int) initRes, IOS_GetVersion());
+	if (initRes < 0)
 	{
 		gprintf("GCAdapter: USB_Initialize failed\n");
 		return;
