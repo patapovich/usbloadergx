@@ -13,6 +13,7 @@
 #include <gccore.h>
 #include <ogc/lwp.h>
 #include <ogc/ipc.h>
+#include <ogc/usb.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -124,54 +125,59 @@ static s32 IntrTransfer(u32 out_dir, void *data, u16 len)
 
 static bool TryOpenAdapter(void)
 {
-	s32 fd = IOS_Open("/dev/usb/hid", 0);
-	if (fd < 0)
-	{
-		DebugLog("hid open=%d\n", (int) fd);
+	// libogc's enumeration works (it opens /dev/usb/hid at USB_Initialize
+	// and its handle passes the version check), while ioctls on a second,
+	// fresh handle all return IPC_EINVAL. So find libogc's own hid fd by
+	// probing for a handle that answers the v5 GetVersion, and issue the
+	// missing Attach handshake plus all transfers on that fd.
+	static usb_device_entry devices[8] ATTRIBUTE_ALIGN(32);
+	u8 count = 0;
+	if (USB_GetDeviceList(devices, 8, USB_CLASS_HID, &count) < 0 || count == 0)
 		return false;
-	}
-
-	u32 *ver = (u32 *) IoBuf;
-	memset(IoBuf, 0, 0x20);
-	s32 res = IOS_Ioctl(fd, HIDV5_IOCTL_GETVERSION, NULL, 0, IoBuf, 0x20);
-	if (res < 0 || ver[0] != 0x50001)
-	{
-		DebugLog("getversion=%d ver=%08x\n", (int) res, (unsigned int) ver[0]);
-		IOS_Close(fd);
-		return false;
-	}
-
-	memset(IoBuf, 0, sizeof(IoBuf));
-	res = IOS_Ioctl(fd, HIDV5_IOCTL_GETDEVICECHANGE, NULL, 0, IoBuf, 0x180);
-	// unlock the manager for other handles no matter what
-	IOS_Ioctl(fd, HIDV5_IOCTL_ATTACHFINISH, NULL, 0, NULL, 0);
-	if (res < 0)
-	{
-		DebugLog("devicechange=%d\n", (int) res);
-		IOS_Close(fd);
-		return false;
-	}
 
 	bool found = false;
-	for (s32 i = 0; i < res && i < 32; i++)
+	for (u8 i = 0; i < count; i++)
 	{
-		const u8 *e = &IoBuf[i * 12];
-		u16 vid = (e[4] << 8) | e[5];
-		u16 pid = (e[6] << 8) | e[7];
-		if (vid == GCA_VID && pid == GCA_PID)
+		if (devices[i].vid == GCA_VID && devices[i].pid == GCA_PID)
 		{
-			DeviceId = *(u32 *) e;
+			DeviceId = (u32) devices[i].device_id;
 			found = true;
 			break;
 		}
 	}
 	if (!found)
+		return false;
+
+	// find the hid host handle: it answers v5 GetVersion AND knows our
+	// device id (the ven handle answers the version too, but rejects
+	// device ioctls for hid device ids)
+	if (HidFd < 0)
 	{
-		IOS_Close(fd);
+		for (s32 fd = 0; fd < 32; fd++)
+		{
+			u32 *ver = (u32 *) IoBuf;
+			memset(IoBuf, 0, 0x20);
+			if (IOS_Ioctl(fd, HIDV5_IOCTL_GETVERSION, NULL, 0, IoBuf, 0x20) != 0 || ver[0] != 0x50001)
+				continue;
+			HidFd = fd;
+			memset(InfoBuf, 0, sizeof(InfoBuf));
+			s32 info = DeviceIoctl(HIDV5_IOCTL_GETDEVICEINFO, NULL, 0, InfoBuf, 0x60);
+			DebugLog("fd %d: v5 host, info=%d\n", (int) fd, (int) info);
+			if (info >= 0)
+				break; // this handle owns our device
+			// try attaching on this handle, maybe info needs it
+			s32 att = DeviceIoctl(HIDV5_IOCTL_ATTACH, NULL, 0, NULL, 0);
+			DebugLog("fd %d: attach=%d\n", (int) fd, (int) att);
+			if (att >= 0)
+				break;
+			HidFd = -1;
+		}
+	}
+	if (HidFd < 0)
+	{
+		DebugLog("no usable v5 hid handle found\n");
 		return false;
 	}
-
-	HidFd = fd;
 
 	s32 attach = DeviceIoctl(HIDV5_IOCTL_ATTACH, NULL, 0, NULL, 0);
 	u32 resumed = 1;
@@ -180,7 +186,6 @@ static bool TryOpenAdapter(void)
 	s32 info = DeviceIoctl(HIDV5_IOCTL_GETDEVICEINFO, NULL, 0, InfoBuf, 0x60);
 	if (info >= 0)
 	{
-		// interrupt endpoint descriptors at fixed offsets, address at +2
 		if (InfoBuf[80 + 2])
 			EpIn = InfoBuf[80 + 2];
 		if (InfoBuf[88 + 2])
@@ -190,13 +195,11 @@ static bool TryOpenAdapter(void)
 	memset(PollCmd, 0, sizeof(PollCmd));
 	PollCmd[0] = 0x13;
 	s32 wr = IntrTransfer(1, PollCmd, 1);
-	DebugLog("id=%08x attach=%d resume=%d info=%d ep=%02x/%02x write=%d\n",
-			 (unsigned int) DeviceId, (int) attach, (int) resume, (int) info, EpIn, EpOut, (int) wr);
+	DebugLog("fd=%d id=%08x attach=%d resume=%d info=%d ep=%02x/%02x write=%d\n",
+			 (int) HidFd, (unsigned int) DeviceId, (int) attach, (int) resume, (int) info, EpIn, EpOut, (int) wr);
 	if (wr < 0)
 	{
 		DeviceIoctl(HIDV5_IOCTL_RELEASE, NULL, 0, NULL, 0);
-		IOS_Close(fd);
-		HidFd = -1;
 		return false;
 	}
 	gprintf("GCAdapter: attached, device %08x\n", (unsigned int) DeviceId);
@@ -221,12 +224,9 @@ static void *AdapterLoop(void *arg)
 		{
 			gprintf("GCAdapter: read error %d\n", res);
 			DebugLog("read error=%d\n", (int) res);
-			s32 fd = HidFd;
-			HidFd = -1;
+			DeviceIoctl(HIDV5_IOCTL_RELEASE, NULL, 0, NULL, 0);
 			PortConnected = false;
 			HeldButtons = 0;
-			if (fd >= 0)
-				IOS_Close(fd);
 			usleep(1000 * 1000);
 			continue;
 		}
@@ -259,8 +259,8 @@ static void *AdapterLoop(void *arg)
 
 	if (HidFd >= 0)
 	{
+		// the fd belongs to libogc's usb subsystem, only release the device
 		DeviceIoctl(HIDV5_IOCTL_RELEASE, NULL, 0, NULL, 0);
-		IOS_Close(HidFd);
 		HidFd = -1;
 	}
 	return NULL;
@@ -270,7 +270,8 @@ void GCAdapter_Init(void)
 {
 	if (Running)
 		return;
-	DebugLog("GCAdapter init, ios=%d\n", IOS_GetVersion());
+	s32 initRes = USB_Initialize();
+	DebugLog("GCAdapter init=%d ios=%d\n", (int) initRes, IOS_GetVersion());
 	Running = true;
 	if (LWP_CreateThread(&AdapterThread, AdapterLoop, NULL, NULL, 16 * 1024, 70) < 0)
 	{
