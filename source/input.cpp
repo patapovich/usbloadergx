@@ -161,9 +161,6 @@ void SetupPads()
 	// check WiiVC to init WiiU gamepad 
 	WiiDRC_Init();
 	isWiiVC = WiiDRC_Inited();
-
-	// USB GameCube controller adapter for menu navigation
-	GCAdapter_Init();
 	
 
 	// read wiimote accelerometer and IR data

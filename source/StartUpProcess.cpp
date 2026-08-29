@@ -10,6 +10,7 @@
 #include "Controls/DeviceHandler.hpp"
 #include "wad/nandtitle.h"
 #include "SystemMenu/SystemMenuResources.h"
+#include "Controls/GCAdapter.h"
 #include "system/IosLoader.h"
 #include "libs/libruntimeiospatch/runtimeiospatch.h"
 #include "utils/timer.h"
@@ -388,6 +389,7 @@ int StartUpProcess::Execute(bool quickGameBoot, bool isBadBoot)
 			usleep(100000);
 		}
 		WPAD_Shutdown();
+		GCAdapter_Shutdown();
 
 		// Unmount devices
 		DeviceHandler::DestroyInstance();
@@ -446,6 +448,10 @@ int StartUpProcess::Execute(bool quickGameBoot, bool isBadBoot)
 
 	// Initialize again
 	ISFS_Initialize();
+
+	// Start the USB GameCube adapter reader only now that the final IOS
+	// is loaded, a thread doing IPC across an IOS reload crashes
+	GCAdapter_Init();
 
 	// Check MIOS version
 	SetTextf("Checking installed MIOS\n");

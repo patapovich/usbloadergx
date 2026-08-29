@@ -66,7 +66,7 @@ static s8 ApplyDeadzone(s16 value)
 
 static bool TryOpenAdapter(void)
 {
-	usb_device_entry devices[8];
+	static usb_device_entry devices[8] ATTRIBUTE_ALIGN(32);
 	u8 count = 0;
 	if (USB_GetDeviceList(devices, 8, USB_CLASS_HID, &count) < 0)
 		return false;
