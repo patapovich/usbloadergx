@@ -23,6 +23,8 @@
 #include "GUI/gui.h"
 #include "gecko.h"
 
+extern "C" s32 USB_GetHidHostFd(void);
+
 #define GCA_VID 0x057E
 #define GCA_PID 0x0337
 #define GCA_REPORT_SIZE 37
@@ -149,7 +151,6 @@ static bool TryOpenAdapter(void)
 		return false;
 
 	// use libogc's own hid handle, exported by our vendored usb.c
-	extern "C" s32 USB_GetHidHostFd(void);
 	HidFd = USB_GetHidHostFd();
 	if (HidFd < 0)
 	{
