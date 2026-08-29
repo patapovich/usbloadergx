@@ -104,17 +104,18 @@ static bool TryOpenAdapter(void)
 		if (devices[i].vid != GCA_VID || devices[i].pid != GCA_PID)
 			continue;
 
-		s32 fd;
-		s32 openRes = USB_OpenDevice(devices[i].device_id, GCA_VID, GCA_PID, &fd);
-		DebugLog("open=%d fd=%d\n", (int) openRes, (int) fd);
-		if (openRes < 0)
-			return false;
+		// Do not use USB_OpenDevice: its descriptor read (GETDEVPARAMS)
+		// fails on d2x cIOS. For v5 device ids (>= 0x20) the transfer
+		// functions accept the device id directly as the handle.
+		s32 resumeRes = USB_ResumeDevice(devices[i].device_id);
 
 		// start polling
-		s32 wr = USB_WriteIntrMsg(fd, GCA_EP_OUT, sizeof(PollCmd), PollCmd);
-		DebugLog("pollcmd write=%d\n", (int) wr);
-		AdapterFd = fd;
-		gprintf("GCAdapter: opened, fd %d\n", fd);
+		s32 wr = USB_WriteIntrMsg(devices[i].device_id, GCA_EP_OUT, sizeof(PollCmd), PollCmd);
+		DebugLog("resume=%d pollcmd write=%d\n", (int) resumeRes, (int) wr);
+		if (wr < 0)
+			return false;
+		AdapterFd = devices[i].device_id;
+		gprintf("GCAdapter: using device id %08x\n", (unsigned int) AdapterFd);
 		return true;
 	}
 	return false;
@@ -137,11 +138,10 @@ static void *AdapterLoop(void *arg)
 		if (res < 0)
 		{
 			gprintf("GCAdapter: read error %d\n", res);
-			s32 fd = AdapterFd;
+			DebugLog("read error=%d\n", (int) res);
 			AdapterFd = -1;
 			PortConnected = false;
 			HeldButtons = 0;
-			USB_CloseDevice(&fd);
 			usleep(1000 * 1000);
 			continue;
 		}
@@ -174,9 +174,8 @@ static void *AdapterLoop(void *arg)
 
 	if (AdapterFd >= 0)
 	{
-		s32 fd = AdapterFd;
+		USB_SuspendDevice(AdapterFd);
 		AdapterFd = -1;
-		USB_CloseDevice(&fd);
 	}
 	return NULL;
 }
