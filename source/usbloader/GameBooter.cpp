@@ -16,6 +16,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
+#include "Controls/GCAdapter.h"
 #include <algorithm>
 
 #include "menu/menus.h"
@@ -268,6 +269,7 @@ void GameBooter::ShutDownDevices(int gameUSBPort)
 	if (Settings.USBPort == 2)
 		USBStorage2_SetPort(gameUSBPort);
 	USBStorage2_Deinit();
+	GCAdapter_Shutdown();
 	if (!Settings.SDMode)
 		USB_Deinitialize();
 }

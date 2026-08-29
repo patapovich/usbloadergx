@@ -1,3 +1,4 @@
+#include "Controls/GCAdapter.h"
 #include <gctypes.h>
 #include <ogc/system.h>
 
@@ -137,6 +138,7 @@ void ExitApp(void)
 	WBFS_CloseAll();
 	DeviceHandler::DestroyInstance();
 	USBStorage2_Deinit();
+	GCAdapter_Shutdown();
 	USB_Deinitialize();
 	if (Settings.PlaylogUpdate)
 		Playlog_Delete(); // Don't show USB Loader GX in the Wii message board

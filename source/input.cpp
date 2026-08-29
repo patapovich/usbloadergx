@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <wiiuse/wpad.h>
 
+#include "Controls/GCAdapter.h"
 #include "libs/libdrc/wiidrc.h"
 #include "menu.h"
 #include "video.h"
@@ -93,6 +94,9 @@ void UpdatePads()
 		userInput[0].pad.substickX = WiiDRC_rStickX();
 		userInput[0].pad.substickY = WiiDRC_rStickY();
 	}
+
+	// USB GameCube controller adapter (WUP-028) written to gamecube pad data
+	GCAdapter_ScanPads();
 }
 
 /****************************************************************************
@@ -157,6 +161,9 @@ void SetupPads()
 	// check WiiVC to init WiiU gamepad 
 	WiiDRC_Init();
 	isWiiVC = WiiDRC_Inited();
+
+	// USB GameCube controller adapter for menu navigation
+	GCAdapter_Init();
 	
 
 	// read wiimote accelerometer and IR data
